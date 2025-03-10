@@ -15,7 +15,6 @@ import time
 import signal
 import atexit
 
-
 # Load environment variables from .env file
 load_dotenv()
 
@@ -25,25 +24,33 @@ SFTP_HOST = os.getenv('SFTP_HOST')
 SFTP_USERNAME = os.getenv('SFTP_USERNAME')
 SFTP_PASSWORD = os.getenv('SFTP_PASSWORD')
 
-# Configure logging
-logging.basicConfig(level=logging.INFO)
+LOG_FILE = "error_log.txt"
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    handlers=[
+        logging.FileHandler(LOG_FILE),   # Log to file
+        logging.StreamHandler()          # Log to console
+    ]
+)
 
 # Global variable to store the last processed row details
 last_processed_row = {'num_records_processed': 0, 'index_id': 0}
 processing_complete = False  # Global flag to track processing completion
 
+
 def signal_handler(file_name, engine, sig, frame):
     """Signal handler for SIGINT."""
     logging.info(f"KeyboardInterrupt (ID: {sig}) has been caught. Cleaning up...")
     if last_processed_row['num_records_processed'] > 0 and not processing_complete:
-        update_checkpoint(engine, file_name, last_processed_row['num_records_processed'], last_processed_row['index_id'], 'interrupted')
+        update_checkpoint(engine, file_name, last_processed_row['num_records_processed'], last_processed_row['index_id'], 'unprocessed')
     logging.info("Cleanup complete. Exiting...")
     exit(0)
 
 def atexit_handler():
     """Handler to update the checkpoint when the program exits."""
     if last_processed_row['num_records_processed'] > 0 and not processing_complete:
-        update_checkpoint(engine, file_name, last_processed_row['num_records_processed'], last_processed_row['index_id'], 'interrupted')
+        update_checkpoint(engine, file_name, last_processed_row['num_records_processed'], last_processed_row['index_id'], 'unprocessed')
     logging.info("Program exited. Checkpoint updated.")
 
 atexit.register(atexit_handler)
@@ -53,7 +60,7 @@ def setup_signal_handlers(file_name, engine):
     def handler(sig, frame):
         logging.info(f"Signal {sig} received. Cleaning up...")
         if last_processed_row['num_records_processed'] > 0 and not processing_complete:
-            update_checkpoint(engine, file_name, last_processed_row['num_records_processed'], last_processed_row['index_id'], 'interrupted')
+            update_checkpoint(engine, file_name, last_processed_row['num_records_processed'], last_processed_row['index_id'], 'unprocessed')
         logging.info("Cleanup complete. Exiting...")
         exit(0)
 
@@ -84,19 +91,14 @@ def get_next_file_to_process(engine, sftp, sftp_path):
 
         # --- 2) If we have any unprocessed, parse their dates from filename ---
         if all_unprocessed:
-            # Each row => parse the date from the filename, store (parsed_date, row)
             parsed_unprocessed = []
             for row in all_unprocessed:
                 try:
-                    # Filename example: TRX20250117.zip
-                    # Extract '20250117' from between 'TRX' and '.zip'
                     base_name = row.filename.replace('.zip', '')
-                    # If your filenames are always TRX + 8-digit date, e.g. TRX20250101
-                    date_str = base_name[-8:]  # last 8 chars
+                    date_str = base_name[-8:]  # last 8 chars, e.g. 20250117
                     file_date = datetime.strptime(date_str, "%Y%m%d").date()
                     parsed_unprocessed.append((file_date, row))
                 except ValueError:
-                    # If filename doesn't match the expected format
                     continue
 
             # Sort by file_date ascending
@@ -159,14 +161,13 @@ def get_next_file_to_process(engine, sftp, sftp_path):
             logging.error(f"Next file {next_file_name} not found on SFTP server.")
             return None
 
-
 def list_files_on_sftp(sftp, sftp_path):
     """List files in the SFTP server directory."""
     try:
         files = sftp.listdir(sftp_path)
         return files
     except Exception as e:
-        logging.error(f"An error occurred while listing files on SFTP server: {e}")
+        logging.error(f"An error occurred while listing files on SFTP server: {e}", exc_info=True)
         return []
 
 def connect_to_sftp():
@@ -177,40 +178,26 @@ def connect_to_sftp():
         sftp = paramiko.SFTPClient.from_transport(transport)
         return sftp, transport
     except Exception as e:
-        logging.error(f"An error occurred while connecting to SFTP server: {e}")
+        logging.error(f"An error occurred while connecting to SFTP server: {e}", exc_info=True)
         return None, None
 
 def update_transaction_status(df):
     """
-    Update the TransactionStatus to 'Batched' where TransactionDeliveryDateTime
-    is not '1900-01-01 00:00:00'.
+    Update the TransactionStatus to 'Batched' where:
+    - TransactionFileName is not null.
     """
-    # Define the condition
-    condition = df['TransactionDeliveryDateTime'] != '1900-01-01 00:00:00'
-
-    # Apply the update
+    condition = df['TransactionFileName'].notna()
     df.loc[condition, 'TransactionStatus'] = 'Batched'
-
     return df
 
 
 def update_mir_reject_status(df):
     """
-    Update the TransactionStatus to 'MIR Reject' where MIRReject is greater than or equal to 1.
-    Additionally, ensure all NaN values remain as NaN and any 0 or 0.0 values are converted to NaN.
+    Update TransactionStatus = 'MIR Reject' where MIRReject is NOT NULL and not 'N'.
     """
-    # Convert 'MIRReject' column to float, ensuring NaNs are handled
-    df['MIRReject'] = pd.to_numeric(df['MIRReject'], errors='coerce')
-    
-    # Replace 0 and 0.0 with NaN (to later be treated as NULL)
-    df['MIRReject'] = df['MIRReject'].replace(0, np.nan)
-    
-    # Define the condition for 'MIR Reject' status
-    condition = df['MIRReject'] >= 1
-
-    # Apply the update to TransactionStatus
-    df.loc[condition, 'TransactionStatus'] = 'MIR Reject'
-
+    if 'MIRReject' in df.columns:
+        condition = df['MIRReject'].notna() & (df['MIRReject'] != 'N')
+        df.loc[condition, 'TransactionStatus'] = 'MIR Reject'
     return df
 
 
@@ -221,50 +208,285 @@ def update_unknown_status(df):
     2. TransactionDeliveryDateTime is '1900-01-01 00:00:00.000000' or NULL
     3. TransactionStatus is 'Batched'
     """
+    #df['TransactionDeliveryDateTime'] = pd.to_datetime(df['TransactionDeliveryDateTime'], errors='coerce')
 
-    # Ensure the datetime format in the DataFrame is compatible with the SQL precision level
-    df['TransactionDeliveryDateTime'] = pd.to_datetime(df['TransactionDeliveryDateTime'], errors='coerce')
-
-    # Define the condition for TransactionType 'T'
     condition_T = (
         (df['TransactionType'] == 'T') &
         ((df['TransactionDeliveryDateTime'] == pd.Timestamp('1900-01-01 00:00:00.000000')) | df['TransactionDeliveryDateTime'].isnull()) &
         (df['TransactionStatus'] == 'Batched')
     )
-
-    # Define the condition for TransactionType 'V'
     condition_V = (
         (df['TransactionType'] == 'V') &
         ((df['TransactionDeliveryDateTime'] == pd.Timestamp('1900-01-01 00:00:00.000000')) | df['TransactionDeliveryDateTime'].isnull()) &
         (df['TransactionStatus'] == 'Batched')
     )
 
-    # Apply the update for both conditions
     df.loc[condition_T | condition_V, 'TransactionStatus'] = 'Unknown'
+    return df
+
+def normalize_mirreject(df):
+    """
+    Normalize the MIRReject column so that:
+      - if it's already 'N', leave it alone
+      - numeric strings like '0.0' => '0', '1.0' => '1'
+      - invalid (non-numeric) => None
+    """
+
+    if 'MIRReject' not in df.columns:
+        logging.warning("Warning: 'MIRReject' column not found in DataFrame.")
+        return df
+
+    # Step 1: Identify rows that are NOT 'N'
+    mask_not_n = (df['MIRReject'] != 'N')
+
+    # Step 2: Convert only those rows to numeric
+    df.loc[mask_not_n, 'MIRReject'] = pd.to_numeric(
+        df.loc[mask_not_n, 'MIRReject'],
+        errors='coerce'
+    )
+
+    # Step 3: Convert numeric types back to integer strings or None
+    df.loc[mask_not_n, 'MIRReject'] = df.loc[mask_not_n, 'MIRReject'].apply(
+        lambda x: str(int(x)) if pd.notnull(x) else None
+    )
+
+    logging.info("\nDistinct MIRReject codes after normalization:")
+    logging.info(df['MIRReject'].value_counts(dropna=False))
 
     return df
 
 
+def download_csv_from_zip_on_sftp(sftp, sftp_path, local_path):
+    """Download CSV file from within ZIP file on SFTP server to local path."""
+    try:
+        with sftp.open(sftp_path, 'rb') as zip_file:
+            with zipfile.ZipFile(zip_file) as zip_ref:
+                zip_file_list = zip_ref.namelist()
+                csv_file_name = next((name for name in zip_file_list if name.endswith('.csv')), None)
+                if not csv_file_name:
+                    logging.error("No CSV file found in the ZIP archive.")
+                    return None
+                with zip_ref.open(csv_file_name) as csv_file:
+                    local_file_path = os.path.join(local_path, os.path.basename(csv_file_name))
+                    with open(local_file_path, 'wb') as local_file:
+                        local_file.write(csv_file.read())
+        return local_file_path
+
+    except Exception as e:
+        logging.error(f"An error occurred while extracting CSV file from ZIP archive on SFTP server: {e}", exc_info=True)
+        return None
+
+def load_csv_data(csv_path):
+    """Load CSV data into a DataFrame and clean up 'None' strings."""
+    df = pd.read_csv(csv_path, dtype=str)
+    df.replace({'None': np.nan, '': np.nan}, inplace=True)
+    return df
+
+def rename_columns(conn, df):
+    """
+    Rename columns in DataFrame according to mapping table, 
+    but skip renaming them in SQL because the DB already has the new names.
+    """
+    column_mapping_df = fetch_column_mapping(conn)
+    column_mapping = {}
+    
+    for _, row in column_mapping_df.iterrows():
+        old_column_name = row['RoadsideColumnName']
+        new_column_name = row['TransformedColumnName']
+        
+        if old_column_name in df.columns:
+            column_mapping[old_column_name] = new_column_name
+            # Rename in the Pandas DataFrame
+            df.rename(columns={old_column_name: new_column_name}, inplace=True)
+            
+
+    return column_mapping
 
 
+def fetch_column_mapping(conn):
+    """Fetch column renaming mapping data from SQL Server."""
+    query = "SELECT RoadsideColumnName, TransformedColumnName FROM tbMappingTableColumns"
+    return pd.read_sql(query, conn)
+
+def fetch_step_one_mapping(conn):
+    """Fetch mapping data from SQL Server."""
+    query = "SELECT * FROM NCTARECONPROD.dbo.tbMappingTableStep1"
+    return pd.read_sql(query, conn)
+
+def perform_step_one_mapping(df, mapping_df):
+    # Filter to T33 if needed
+    if 'Roadway' in mapping_df.columns:
+        mapping_df = mapping_df[mapping_df['Roadway'] == 'T33']
+
+    if mapping_df.empty:
+        return df
+
+    # Convert any 'NULL' or 'None' to actual None in the mapping table
+    mapping_df = mapping_df.replace({'NULL': None, 'None': None, '': None, np.nan: None})
+
+    # Ensure columns exist in df
+    unique_search_cols = mapping_df['RoadsideColumnA'].dropna().unique()
+    for col in unique_search_cols:
+        if col in df.columns and df[col].dtype != object:
+            df[col] = df[col].astype(str)
+
+    # Ensure all final columns exist in df
+    unique_replace_cols = mapping_df['TransformedColumn'].dropna().unique()
+    for col in unique_replace_cols:
+        if col not in df.columns:
+            df[col] = None
+
+    group_cols = ['RoadsideColumnA', 'TransformedColumn']
+    grouped = mapping_df.groupby(group_cols, dropna=True)
+
+    for (col_search, col_replace), submap in tqdm(grouped, desc="Step One Mapping Groups"):
+        if col_search not in df.columns or col_replace not in df.columns:
+            continue
+        replace_dict = {}
+        null_val_replace = None
+
+        for _, row in submap.iterrows():
+            val_search = row['RoadsideValueA']
+            val_replace = row['TransformedValue']
+
+            if pd.isnull(val_search):
+                null_val_replace = val_replace
+            else:
+                replace_dict[str(val_search)] = val_replace
+
+        # Apply the dictionary mapping
+        mapped_series = df[col_search].map(replace_dict)
+
+        # Apply the null value mapping
+        if null_val_replace is not None:
+            null_mask = df[col_search].isnull() | (df[col_search] == 'nan')
+            df.loc[null_mask, col_replace] = null_val_replace
+
+        df[col_replace] = mapped_series.where(mapped_series.notnull(), df[col_replace])
+
+    return df
+
+def fetch_step_two_mapping(conn):
+    """Fetch additional mapping data from SQL Server."""
+    query = "SELECT * FROM NCTARECONPROD.dbo.tbMappingTableStep2"
+    return pd.read_sql(query, conn)
+
+def perform_step_two_mapping(df, mapping_df):
+    if 'Roadway' in mapping_df.columns:
+        mapping_df = mapping_df[mapping_df['Roadway'] == 'T33']
+    else:
+        return df
+
+    if mapping_df.empty:
+        return df
+
+    # Convert 'NULL'/'None' to None
+    mapping_df = mapping_df.replace({'NULL': None, 'None': None, '': None, np.nan: None})
+
+    colA_list = mapping_df['RoadsideColumnA'].dropna().unique()
+    colB_list = mapping_df['RoadsideColumnB'].dropna().unique()
+
+    for col in colA_list:
+        if col in df.columns and df[col].dtype != object:
+            df[col] = df[col].astype(str)
+    for col in colB_list:
+        if col in df.columns and df[col].dtype != object:
+            df[col] = df[col].astype(str)
+
+    transformed_cols = mapping_df['TransformedColumn'].dropna().unique()
+    for col in transformed_cols:
+        if col not in df.columns:
+            df[col] = None
+
+    for _, row in tqdm(mapping_df.iterrows(), total=len(mapping_df), desc="Step Two Mapping"):
+        colA = row['RoadsideColumnA']
+        valA = row['RoadsideValueA']
+        colB = row['RoadsideColumnB']
+        valB = row['RoadsideValueB']
+        trans_col = row['TransformedColumn']
+        trans_val = row['TransformedValue']
+
+        if not colA or not colB or not trans_col or pd.isnull(trans_val):
+            continue
+        if (colA not in df.columns) or (colB not in df.columns) or (trans_col not in df.columns):
+            continue
+
+        # Build masks
+        if pd.isnull(valA):
+            maskA = df[colA].isnull() | (df[colA] == 'nan')
+        else:
+            maskA = df[colA] == str(valA)
+
+        if pd.isnull(valB):
+            maskB = df[colB].isnull() | (df[colB] == 'nan')
+        else:
+            maskB = df[colB] == str(valB)
+
+        df.loc[maskA & maskB, trans_col] = trans_val
+
+    return df
+
+def fetch_step_three_mapping(conn):
+    """Fetch column renaming mapping data from SQL Server."""
+    query = "SELECT * FROM NCTARECONPROD.dbo.tbMappingOCRValues"
+    return pd.read_sql(query, conn)
+
+def perform_step_three_mapping(df, mapping_df):
+    # Filter to T33 if that is relevant
+    if 'Roadway' in mapping_df.columns:
+        mapping_df = mapping_df[mapping_df['Roadway'] == 'T33']
+    if mapping_df.empty:
+        return df
+
+    for _, row in tqdm(mapping_df.iterrows(), total=len(mapping_df), desc="Step Three Mapping"):
+        colA = row.get('ColumnA')
+        colB = row.get('ColumnB')
+        colC = row.get('ColumnC')
+        final_col = row.get('FinalColumn')
+
+        if not colA or not colB or not colC or not final_col:
+            continue
+
+        if colA not in df.columns:
+            df[colA] = None
+        if colB not in df.columns:
+            df[colB] = None
+        if colC not in df.columns:
+            df[colC] = None
+        if final_col not in df.columns:
+            df[final_col] = None
+
+        # If colA not null => final_col = colA
+        maskA = df[colA].notnull()
+        df.loc[maskA, final_col] = df.loc[maskA, colA]
+
+        # If final_col still null => use colB
+        maskB = df[final_col].isnull() & df[colB].notnull()
+        df.loc[maskB, final_col] = df.loc[maskB, colB]
+
+        # If final_col still null => use colC
+        maskC = df[final_col].isnull() & df[colC].notnull()
+        df.loc[maskC, final_col] = df.loc[maskC, colC]
+
+    return df
 
 def main():
-    global engine, file_name, processing_complete
+    global engine, file_name, processing_complete, last_processed_row
     try:
-        # Create database engine
+        # 1) Create the database engine
         engine = create_engine(DATABASE_URI)
 
         while True:
-            # Connect to SFTP server
+            # 2) Connect to SFTP server
             sftp, transport = connect_to_sftp()
             if sftp is None or transport is None:
                 logging.error("Failed to establish SFTP connection. Exiting.")
                 break
 
             logging.info("Determining the next file to process...")
-            # Determine the next file to process
-            file_name = get_next_file_to_process(engine, sftp, '/Dataingest/')
 
+            # 3) Determine the next file to process
+            file_name = get_next_file_to_process(engine, sftp, '/Dataingest/')
             if not file_name:
                 logging.info("No more files to process.")
                 sftp.close()
@@ -273,9 +495,9 @@ def main():
 
             logging.info(f"Processing file: {file_name}")
 
-            # Download CSV file from within ZIP file on SFTP server
+            # 4) Download the CSV from within the ZIP file on SFTP
             sftp_full_path = f'/Dataingest/{file_name}'
-            local_path = r'C:\Users\KhokharA\Documents\LoadData\RoadsideCSVs'  # Your local path
+            local_path = r'R:\NCTAFileProcessing\LoadData\RoadsideCSVs'
 
             logging.info(f"Downloading CSV from within ZIP file from SFTP server: {sftp_full_path}")
             local_csv_path = download_csv_from_zip_on_sftp(sftp, sftp_full_path, local_path)
@@ -286,108 +508,110 @@ def main():
                 transport.close()
                 break
 
-            # After loading data
+            # 5) Load CSV data
             triex_recon_df = load_csv_data(local_csv_path)
-
-            # Make sure to clean 'None' strings that might still be present
-            triex_recon_df.replace({'None': np.nan, '': np.nan}, inplace=True)
-
             if triex_recon_df.empty:
                 logging.error("CSV file could not be loaded or is empty.")
                 sftp.close()
                 transport.close()
                 break
 
-            # Continue with the rest of your processing steps...
+            # For debugging
+            null_bos_delivery_time_count = triex_recon_df[
+                triex_recon_df['BOS_DELIVERY_TIME'].isnull() & triex_recon_df['EFI_FILE_NAME'].notnull()
+            ].shape[0]
+            logging.info(f"Debug: BOS_DELIVERY_TIME null but EFI_FILE_NAME present count: {null_bos_delivery_time_count}")
 
-            # Rename columns and get column mapping
+            # 6) Normalize MIRReject
+            triex_recon_df = normalize_mirreject(triex_recon_df)
+            triex_recon_df.replace({'None': np.nan, '': np.nan}, inplace=True)
+
+            # 7) Reflect DB metadata
             metadata = MetaData()
             metadata.reflect(bind=engine)
+
             with engine.connect() as conn:
-                # Check existing checkpoint for the file
+                # 7a) Check existing checkpoint for partial progress
                 checkpoint_table = Table('tbCheckpoint', metadata, autoload_with=engine)
                 checkpoint_record = conn.execute(
                     select(checkpoint_table).where(checkpoint_table.c.filename == file_name)
                 ).fetchone()
 
+                last_processed_index = 0
+                last_processed_id = 0
                 if checkpoint_record:
-                    logging.info(f"Checkpoint exists: {checkpoint_record}")
-                    last_processed_index = checkpoint_record.numrecordsprocessed  # Start from the last processed row
+                    last_processed_index = checkpoint_record.numrecordsprocessed or 0
+                    last_processed_id = checkpoint_record.indexid or 0
 
                     if last_processed_index >= len(triex_recon_df):
-                        logging.info("All rows in the file have been processed. No new rows to process.")
+                        logging.info("All rows in the file have already been processed.")
+                        update_checkpoint(
+                            engine,
+                            file_name,
+                            num_records_processed=last_processed_index,
+                            index_id=last_processed_id,
+                            status="processed"
+                        )
                         sftp.close()
                         transport.close()
                         continue
-                else:
-                    # logging.info("No checkpoint found. Processing from the beginning.")
-                    last_processed_index = 0
 
-                triex_recon_df = triex_recon_df.iloc[last_processed_index:]
+                # Re-initialize the global last_processed_row
+                last_processed_row['num_records_processed'] = last_processed_index
+                last_processed_row['index_id'] = last_processed_id
 
-                if triex_recon_df.empty:
-                    logging.info("No new rows to process.")
-                    sftp.close()
-                    transport.close()
-                    continue
+                # Slice the DataFrame
+                triex_recon_df = triex_recon_df.iloc[last_processed_index:].copy()
 
-                # Rename columns based on mapping table
+                # 7b) Rename columns
                 rename_columns(conn, triex_recon_df)
 
-                # Rename history columns
-                #history_column_df = fetch_history_table(conn, metadata)
-                #rename_history_columns(conn, history_column_df)
-
-                # Fetch step one mapping data from SQL Server
+                # 7c) Step One Mapping
                 step_one_mapping_df = fetch_step_one_mapping(conn)
-
-                # Perform step one mapping
                 triex_recon_df = perform_step_one_mapping(triex_recon_df, step_one_mapping_df)
-                print("Step one mapping complete")
-                print("Columns in df after Step 1:", triex_recon_df.columns.tolist())
+                logging.info("Step one mapping complete")
 
-
-                # Fetch step two mapping data from SQL Server
+                # 7d) Step Two Mapping
                 step_two_mapping_df = fetch_step_two_mapping(conn)
-
-                # Perform step two mapping
                 triex_recon_df = perform_step_two_mapping(triex_recon_df, step_two_mapping_df)
-                print("Step two mapping complete")
+                logging.info("Step two mapping complete")
 
-                # Fetch Step 3 Mapping data from SQL Server
+                # 7e) Step Three Mapping
                 step_three_mapping_df = fetch_step_three_mapping(conn)
-
-                # Perform Step 3 mapping
                 triex_recon_df = perform_step_three_mapping(triex_recon_df, step_three_mapping_df)
-                print("Step three mapping complete")
+                logging.info("Step three mapping complete")
 
-                # Data Transformation and Status Updates
-                triex_recon_df = update_transaction_status(triex_recon_df)
+                # 7f) Data Transformation and Status Updates
                 triex_recon_df = update_mir_reject_status(triex_recon_df)
-                triex_recon_df = update_unknown_status(triex_recon_df)  # New function added here
+                triex_recon_df = update_unknown_status(triex_recon_df)
+                triex_recon_df = update_transaction_status(triex_recon_df)
 
-                # Cast all values to strings
-                triex_recon_df = triex_recon_df.astype(str)
-                triex_recon_df['TransactionID'] = triex_recon_df['TransactionID'].astype(np.int64)
+            # 8) Convert columns to string (except MIRReject) and replace 'nan'
+            cols_to_exclude = ['MIRReject']
+            for col in triex_recon_df.columns:
+                if col not in cols_to_exclude:
+                    triex_recon_df[col] = triex_recon_df[col].astype(str)
+            triex_recon_df.replace('nan', None, inplace=True)
 
-                # Replace 'nan' strings with None
-                triex_recon_df.replace('nan', None, inplace=True)
+            # 9) Convert TransactionID safely to nullable integer
+            triex_recon_df['TransactionID'] = pd.to_numeric(
+                triex_recon_df['TransactionID'],
+                errors='coerce'
+            ).astype('Int64')
 
-                # Setup signal handlers
-                setup_signal_handlers(file_name, engine)
+            # 10) Setup signal handlers
+            setup_signal_handlers(file_name, engine)
 
-                # Insert transformed data into SQL Server
-                insert_data_into_sql(engine, triex_recon_df, file_name)
+            # 11) Insert transformed data into SQL Server with advanced duplicate handling
+            insert_data_into_sql(engine, triex_recon_df, file_name)
+            processing_complete = True
 
-                processing_complete = True  # Mark processing as complete if no exceptions occur
-
-            # Close SFTP connection
+            # Close SFTP before next loop iteration
             sftp.close()
             transport.close()
 
     except Exception as e:
-        logging.error(f"An error occurred: {e}")
-
+        logging.error(f"An error occurred: {e}", exc_info=True)
 
 
 def update_checkpoint(engine, file_name, num_records_processed, index_id, status):
@@ -399,18 +623,15 @@ def update_checkpoint(engine, file_name, num_records_processed, index_id, status
         metadata.reflect(bind=engine)
         checkpoint_table = Table('tbCheckpoint', metadata, autoload_with=engine)
         
-        # Get the current timestamp
         current_timestamp = datetime.now()
-
-        # Convert numpy.int64 to Python int
         num_records_processed = int(num_records_processed)
         index_id = int(index_id)
         
-        # Check if there is an existing record for the file
-        existing_record = session.execute(select(checkpoint_table).where(checkpoint_table.c.filename == file_name)).fetchone()
+        existing_record = session.execute(
+            select(checkpoint_table).where(checkpoint_table.c.filename == file_name)
+        ).fetchone()
         
         if existing_record:
-            # Update the existing record
             update_query = (
                 checkpoint_table.update()
                 .where(checkpoint_table.c.filename == file_name)
@@ -423,7 +644,6 @@ def update_checkpoint(engine, file_name, num_records_processed, index_id, status
             )
             session.execute(update_query)
         else:
-            # Insert a new record
             insert_query = checkpoint_table.insert().values(
                 filename=file_name,
                 numrecordsprocessed=num_records_processed,
@@ -437,35 +657,57 @@ def update_checkpoint(engine, file_name, num_records_processed, index_id, status
         session.commit()
         logging.info(f"Checkpoint updated: {file_name, num_records_processed, index_id, status}")
     except Exception as e:
-        logging.error(f"Failed to update checkpoint: {e}")
+        logging.error(f"Failed to update checkpoint: {e}", exc_info=True)
     finally:
         session.close()
 
 def insert_data_into_sql(engine, df, file_name, batch_size=1000, max_retries=5, retry_wait=1):
-    """Insert or update transformed data into SQL Server using bulk inserts and log updates to a history table."""
+    """
+    Insert or update transformed data into SQL Server for TRIX using batch inserts.
+    This version pre-checks each batch to separate new records from duplicates.
+    """
     global last_processed_row
     try:
-        # Define the table names
+        # TRIX table names
         table_name = 'tbtriexrecondailydetail'
         history_table_name = 'tbtriexrecondailydetailhist'
-        
-        # Add UpdatedBy and UpdatedTimeStamp columns to the DataFrame
+
+        # Add audit/information columns
         current_user = 'NCTA_Reports'
         current_timestamp = datetime.now()
         df['UpdatedBy'] = current_user
         df['UpdatedTimeStamp'] = current_timestamp
+        df['IngestName'] = file_name  # Track which file was ingested
 
-        # Ensure datetime columns are properly converted to datetime objects and then formatted
-        datetime_columns = ['TransactionDateTime', 'DispositionReceiptDateTime', 'TransactionDeliveryDateTime', 'TimeRecievedByRSS']
+        # --- Unified Datetime Conversion ---
+        # Define the columns that are supposed to contain datetimes.
+        datetime_columns = [
+            'TransactionDateTime',
+            'DispositionReceiptDateTime',
+            'TransactionDeliveryDateTime',
+            'TimeRecievedByRSS'
+        ]
+
         for col in datetime_columns:
             if col in df.columns:
-                df[col] = pd.to_datetime(df[col], errors='coerce')  # Convert to datetime, coerce errors to NaT
-                df[col] = df[col].apply(lambda x: x.strftime('%Y-%m-%d %H:%M:%S') if not pd.isnull(x) else None)
+                # If the value is a string and longer than 26 characters, truncate to 26
+                # (e.g., removing extremely long microsecond or nanosecond strings).
+                df[col] = df[col].apply(
+                    lambda x: x[:26] if isinstance(x, str) and len(x) > 26 else x
+                )
+                # Attempt to parse as datetime. We are *not* enforcing a single format string here,
+                # since some columns might be in different date/time formats. If you know the exact 
+                # format for all columns, you could pass `format="..."`.
+                df[col] = pd.to_datetime(df[col], errors='coerce')
+                # Reformat each datetime column as "YYYY-MM-DD HH:MM:SS" if not null
+                df[col] = df[col].apply(
+                    lambda x: x.strftime('%Y-%m-%d %H:%M:%S') if pd.notnull(x) else None
+                )
 
-        # Replace 'None' strings and NaN with actual None to reflect NULL in SQL
-        df.replace([np.nan, 'None', 'nan'], None, inplace=True)
+        # Replace stray 'nan' strings and np.nan with None
+        df.replace(['nan', np.nan, 'None'], None, inplace=True)
 
-        # Create a SQLAlchemy session
+        # Create a SQLAlchemy session and reflect the metadata
         Session = sessionmaker(bind=engine)
         session = Session()
         metadata = MetaData()
@@ -473,10 +715,27 @@ def insert_data_into_sql(engine, df, file_name, batch_size=1000, max_retries=5, 
         table = Table(table_name, metadata, autoload_with=engine)
         history_table = Table(history_table_name, metadata, autoload_with=engine)
 
-        # Process data row by row with a progress bar
-        with tqdm(total=df.shape[0], desc="Inserting Data", unit="row") as pbar:
-            insert_batch_with_duplicate_handling(session, table, history_table, df, file_name, engine, max_retries, retry_wait, pbar)
+        total_rows = len(df)
+        logging.info(f"Starting batch insert for {total_rows} rows.")
+        with tqdm(total=total_rows, desc="Inserting Data", unit="row") as pbar:
+            start_idx = 0
+            while start_idx < total_rows:
+                end_idx = start_idx + batch_size
+                chunk_df = df.iloc[start_idx:end_idx]
+                _ = insert_batch_with_duplicate_handling(
+                        session,
+                        table,
+                        history_table,
+                        chunk_df,
+                        file_name,
+                        engine,
+                        max_retries,
+                        retry_wait,
+                        pbar
+                    )
+                start_idx += batch_size
 
+        # Once all rows are processed, update the checkpoint as 'processed'
         if not df.empty:
             update_checkpoint(engine, file_name, len(df), df['TransactionID'].iloc[-1], 'processed')
         logging.info("Data inserted/updated successfully.")
@@ -484,7 +743,7 @@ def insert_data_into_sql(engine, df, file_name, batch_size=1000, max_retries=5, 
     except IntegrityError as ie:
         logging.error(f"Integrity error: {ie}")
     except Exception as e:
-        logging.error(f"Error inserting data: {e}")
+        logging.error(f"Error inserting data: {e}", exc_info=True)
     finally:
         session.close()
         logging.info("Database session closed.")
@@ -492,574 +751,187 @@ def insert_data_into_sql(engine, df, file_name, batch_size=1000, max_retries=5, 
 
 
 
-def insert_batch_with_duplicate_handling(
-    session,
-    table,
-    history_table,
-    batch,
-    file_name,
-    engine,
-    max_retries=5,
-    retry_wait=1,
-    pbar=None
-):
+def insert_batch_with_duplicate_handling(session, table, history_table, df_chunk, file_name, engine, max_retries=5, retry_wait=1, pbar=None):
     """
-    Insert or update data in 'table' with duplicate (TransactionID) handling,
-    processing rows in batches of 100 for faster insert performance.
-    Uses nested transactions (savepoints) so a single row failure
-    doesn't blow up the entire chunk transaction.
+    Process a DataFrame chunk by first pre-checking which rows are new and which are duplicates.
+    - New records are bulk inserted.
+    - Duplicate records are processed row-by-row using duplicate-resolution logic.
+    
+    Before inserting, each record is checked for the mandatory column 'TransactionDeliveryDateTime'.
+    If that value is None, it is replaced with the default "1900-01-01 00:00:00".
+    
+    Duplicate resolution now includes:
+      - If the new row’s TransactionStatus is "Waiting MIR" and the existing row’s TransactionStatus is "Unknown",
+        then the new row is given preference (after archiving the existing record) and updates the main table.
+      - In all cases, if a duplicate does not update the main table, it is inserted into the history table.
     """
-
-    import pandas as pd
     from sqlalchemy import select
     from sqlalchemy.exc import IntegrityError, OperationalError
-    import time
-    import logging
-
     global last_processed_row
 
-    records = batch.to_dict("records")  # Each row -> dict
-    rows_processed_since_last_checkpoint = 0
+    # Convert the chunk to a list of dictionaries.
+    records = df_chunk.to_dict("records")
+    if not records:
+        return 0
 
-    CHUNK_SIZE = 100  # how many rows per chunk
+    # --- Ensure mandatory column 'TransactionDeliveryDateTime' is not None ---
+    # If the value is None, assign a default value.
+    for r in records:
+        if r.get("TransactionDeliveryDateTime") is None:
+            r["TransactionDeliveryDateTime"] = "1900-01-01 00:00:00"
 
-    for chunk_start in range(0, len(records), CHUNK_SIZE):
-        chunk = records[chunk_start : chunk_start + CHUNK_SIZE]
+    # --- Pre-check: Partition new vs. duplicate records ---
+    transaction_ids = [r["TransactionID"] for r in records]
+    existing_query = select(table.c.TransactionID).where(table.c.TransactionID.in_(transaction_ids))
+    existing_result = session.execute(existing_query).fetchall()
+    existing_ids = {row[0] for row in existing_result}
 
-        # Begin a single transaction for this entire chunk
-        session.begin()  # main transaction for up to 100 rows
+    new_records = [r for r in records if r["TransactionID"] not in existing_ids]
+    duplicate_records = [r for r in records if r["TransactionID"] in existing_ids]
 
-        for i, row_dict in enumerate(chunk):
-            idx = chunk_start + i  # absolute row index
+    # --- Bulk insert new records using the proper transaction block ---
+    if new_records:
+        try:
+            if session.in_transaction():
+                # Already in a transaction: use a nested transaction (SAVEPOINT)
+                with session.begin_nested():
+                    session.execute(table.insert(), new_records)
+            else:
+                # No transaction active: start a new one
+                with session.begin():
+                    session.execute(table.insert(), new_records)
+            for row_dict in new_records:
+                last_processed_row["num_records_processed"] += 1
+                last_processed_row["index_id"] = row_dict["TransactionID"]
+                if pbar is not None:
+                    pbar.update(1)
+        except Exception as e:
+            session.rollback()
+            logging.error("Error during bulk insert of new records: %s", e)
+            # Fallback: process new records row-by-row if needed.
+            for row_dict in new_records:
+                process_record_row_by_row(session, table, history_table, row_dict, max_retries, retry_wait, pbar)
 
-            # We can do multiple attempts for deadlock handling
-            retries = 0
-            while retries < max_retries:
-                try:
-                    # Begin a nested transaction (savepoint) for this single row
-                    with session.begin_nested():
-                        # Attempt to insert
-                        session.execute(table.insert().values(row_dict))
+    # --- Process duplicate records row-by-row ---
+    for row_dict in duplicate_records:
+        process_record_row_by_row(session, table, history_table, row_dict, max_retries, retry_wait, pbar)
 
-                    # If insertion succeeded, break out of retry loop
-                    break
+    session.commit()
+    return len(new_records) + len(duplicate_records)
 
-                except IntegrityError:
-                    # This means a duplicate or constraint violation
-                    session.rollback()  # rollback just this sub-transaction
 
-                    # Handle duplicates
-                    existing_row = session.execute(
-                        select(table)
-                        .with_hint(table, "WITH (NOLOCK)", dialect_name="mssql")
-                        .where(table.c.TransactionID == row_dict["TransactionID"])
-                    ).fetchone()
+def process_record_row_by_row(session, table, history_table, row_dict, max_retries, retry_wait, pbar):
+    """
+    Process a single record using duplicate-resolution logic with retries.
+    This function:
+      - Ensures the mandatory column 'TransactionDeliveryDateTime' is not None (assigns default if needed).
+      - Retrieves the existing record.
+      - Compares key date fields and TransactionStatus.
+      - Applies the special condition: if new status is "Waiting MIR" and existing status is "Unknown",
+        then update the main table.
+      - Otherwise, if conditions for update are met (by date or by known status), update the main table
+        (after archiving the existing record).
+      - If none of the update conditions are met, inserts the row into the history table.
+    """
+    from sqlalchemy import select
+    from sqlalchemy.exc import IntegrityError, OperationalError
 
-                    if existing_row:
-                        existing_row_dict = dict(zip(table.columns.keys(), existing_row))
+    # Ensure mandatory column 'TransactionDeliveryDateTime' is not None.
+    if row_dict.get("TransactionDeliveryDateTime") is None:
+        row_dict["TransactionDeliveryDateTime"] = "1900-01-01 00:00:00"
 
-                        # Example: parse relevant date fields
-                        existing_disposition_date = pd.to_datetime(
-                            existing_row_dict.get("DispositionReceiptDateTime"), errors="coerce"
+    retries = 0
+    while retries < max_retries:
+        try:
+            with session.begin_nested():
+                # Fetch the existing record
+                existing = session.execute(
+                    select(table).where(table.c.TransactionID == row_dict["TransactionID"])
+                ).fetchone()
+                if existing:
+                    existing_row_dict = dict(zip(table.columns.keys(), existing))
+                    existing_disp_date = pd.to_datetime(existing_row_dict.get("DispositionReceiptDateTime"), errors="coerce")
+                    new_disp_date = pd.to_datetime(row_dict.get("DispositionReceiptDateTime"), errors="coerce")
+                    existing_trans_date = pd.to_datetime(existing_row_dict.get("TransactionDeliveryDateTime"), errors="coerce")
+                    new_trans_date = pd.to_datetime(row_dict.get("TransactionDeliveryDateTime"), errors="coerce")
+                    new_status = row_dict.get("TransactionStatus")
+                    existing_status = existing_row_dict.get("TransactionStatus")
+
+                    # Ensure we do not overwrite a non-null TransactionDeliveryDateTime with a null value
+                    if existing_row_dict.get("TransactionDeliveryDateTime") is not None and row_dict.get("TransactionDeliveryDateTime") is None:
+                        row_dict["TransactionDeliveryDateTime"] = existing_row_dict["TransactionDeliveryDateTime"]
+
+                    # Refresh the UpdatedTimeStamp
+                    row_dict["UpdatedTimeStamp"] = datetime.now()
+
+                    # --- Duplicate resolution logic ---
+                    if new_status == "Waiting MIR" and existing_status == "Unknown":
+                        # Give preference to "Waiting MIR" by updating the main table.
+                        session.execute(history_table.insert().values(existing_row_dict))
+                        session.execute(
+                            table.update()
+                            .where(table.c.TransactionID == row_dict["TransactionID"])
+                            .values(row_dict)
                         )
-                        new_disposition_date = pd.to_datetime(
-                            row_dict.get("DispositionReceiptDateTime"), errors="coerce"
+                    elif new_status in ["Batched", "MIR Reject", "Duplicate"]:
+                        session.execute(history_table.insert().values(existing_row_dict))
+                        session.execute(
+                            table.update()
+                            .where(table.c.TransactionID == row_dict["TransactionID"])
+                            .values(row_dict)
                         )
-
-                        existing_transaction_date = pd.to_datetime(
-                            existing_row_dict.get("TransactionDeliveryDateTime"), errors="coerce"
+                    elif all([
+                        pd.isnull(existing_disp_date),
+                        pd.isnull(existing_trans_date),
+                        pd.isnull(new_disp_date),
+                        pd.isnull(new_trans_date)
+                    ]):
+                        session.execute(history_table.insert().values(existing_row_dict))
+                        session.execute(
+                            table.update()
+                            .where(table.c.TransactionID == row_dict["TransactionID"])
+                            .values(row_dict)
                         )
-                        new_transaction_date = pd.to_datetime(
-                            row_dict.get("TransactionDeliveryDateTime"), errors="coerce"
+                    elif (existing_disp_date is None) or (new_disp_date is not None and new_disp_date > existing_disp_date):
+                        session.execute(history_table.insert().values(existing_row_dict))
+                        session.execute(
+                            table.update()
+                            .where(table.c.TransactionID == row_dict["TransactionID"])
+                            .values(row_dict)
                         )
-
-                        new_status = row_dict.get("TransactionStatus")
-
-                        # Begin another sub-transaction for handling duplicates
-                        with session.begin_nested():
-
-                            # 1) If the new record is in certain statuses => overwrite existing
-                            if new_status in ["Batched", "MIR Reject", "Duplicate"]:
-                                session.execute(history_table.insert().values(existing_row_dict))
-                                session.execute(
-                                    table.update()
-                                    .where(table.c.TransactionID == row_dict["TransactionID"])
-                                    .values(row_dict)
-                                )
-
-                            # 2) If both existing and new are missing those date fields
-                            elif (
-                                pd.isnull(existing_disposition_date)
-                                and pd.isnull(existing_transaction_date)
-                                and pd.isnull(new_disposition_date)
-                                and pd.isnull(new_transaction_date)
-                            ):
-                                session.execute(history_table.insert().values(existing_row_dict))
-                                session.execute(
-                                    table.update()
-                                    .where(table.c.TransactionID == row_dict["TransactionID"])
-                                    .values(row_dict)
-                                )
-
-                            # 3) If new dates are strictly newer => overwrite existing
-                            elif existing_disposition_date is None or (
-                                new_disposition_date is not None
-                                and new_disposition_date > existing_disposition_date
-                            ):
-                                session.execute(history_table.insert().values(existing_row_dict))
-                                session.execute(
-                                    table.update()
-                                    .where(table.c.TransactionID == row_dict["TransactionID"])
-                                    .values(row_dict)
-                                )
-                            elif existing_transaction_date is None or (
-                                new_transaction_date is not None
-                                and new_transaction_date > existing_transaction_date
-                            ):
-                                session.execute(history_table.insert().values(existing_row_dict))
-                                session.execute(
-                                    table.update()
-                                    .where(table.c.TransactionID == row_dict["TransactionID"])
-                                    .values(row_dict)
-                                )
-
-                            # 4) NEW LOGIC: if *all* date/time checks are exactly the same,
-                            #    treat the new row as the "newer" version. 
-                            elif (
-                                existing_disposition_date == new_disposition_date
-                                and existing_transaction_date == new_transaction_date
-                                # Add more equality checks here if needed, e.g. same amounts, etc.
-                            ):
-                                # Move the old row to history, store the new row in the main table
-                                session.execute(history_table.insert().values(existing_row_dict))
-                                session.execute(
-                                    table.update()
-                                    .where(table.c.TransactionID == row_dict["TransactionID"])
-                                    .values(row_dict)
-                                )
-
-                            else:
-                                # If the new row is "older" or doesn't meet other criteria,
-                                # add it to the history only
-                                session.execute(history_table.insert().values(row_dict))
-
-                    # Done handling the duplicate; break out of retry loop
-                    break
-
-                except OperationalError as oe:
-                    # Handle deadlock victims with retries
-                    if "deadlock victim" in str(oe):
-                        retries += 1
-                        logging.warning(f"Deadlock detected. Retrying {retries}/{max_retries}...")
-                        session.rollback()
-                        time.sleep(retry_wait * (2 ** retries))
-                        continue  # retry
+                    elif (existing_trans_date is None) or (new_trans_date is not None and new_trans_date > existing_trans_date):
+                        session.execute(history_table.insert().values(existing_row_dict))
+                        session.execute(
+                            table.update()
+                            .where(table.c.TransactionID == row_dict["TransactionID"])
+                            .values(row_dict)
+                        )
                     else:
-                        session.rollback()
-                        raise
-
-                except Exception as e:
-                    session.rollback()
-                    raise
-
-            # Checkpoint logic every 1000 rows
-            rows_processed_since_last_checkpoint += 1
-            if rows_processed_since_last_checkpoint >= 1000:
-                update_checkpoint(engine, file_name, idx + 1, row_dict["TransactionID"], "unprocessed")
-                rows_processed_since_last_checkpoint = 0
-
-            # Update global last_processed_row
-            last_processed_row["num_records_processed"] = idx + 1
-            last_processed_row["index_id"] = row_dict["TransactionID"]
-
-            if pbar is not None:
-                pbar.update(1)
-
-        # Commit the chunk (up to 100 rows)
-        session.commit()
-
-    # Final checkpoint after all records
-    if records:
-        final_idx = len(records) - 1
-        last_row = records[final_idx]
-        update_checkpoint(engine, file_name, final_idx + 1, last_row["TransactionID"], "unprocessed")
-
-
-
-
-
-def download_csv_from_zip_on_sftp(sftp, sftp_path, local_path):
-    """Download CSV file from within ZIP file on SFTP server to local path."""
-    try:
-        # Open the ZIP file on the SFTP server
-        with sftp.open(sftp_path, 'rb') as zip_file:
-            with zipfile.ZipFile(zip_file) as zip_ref:
-                # Get the list of files in the ZIP
-                zip_file_list = zip_ref.namelist()
-                # Find the CSV file in the ZIP
-                csv_file_name = next((name for name in zip_file_list if name.endswith('.csv')), None)
-                if not csv_file_name:
-                    logging.error("No CSV file found in the ZIP archive.")
-                    return None
-                # Extract the CSV file content
-                with zip_ref.open(csv_file_name) as csv_file:
-                    local_file_path = os.path.join(local_path, os.path.basename(csv_file_name))
-                    with open(local_file_path, 'wb') as local_file:
-                        local_file.write(csv_file.read())
-        return local_file_path
-
-    except Exception as e:
-        logging.error(f"An error occurred while extracting CSV file from ZIP archive on SFTP server: {e}")
-        return None
-
-def load_csv_data(csv_path):
-    """Load CSV data into a DataFrame and clean up 'None' strings."""
-    df = pd.read_csv(csv_path, dtype=str)  # Load as strings
-
-    # Convert 'TransactionDeliveryDateTime' to datetime, ensuring correct precision
-    #df['TransactionDeliveryDateTime'] = pd.to_datetime(df['TransactionDeliveryDateTime'], errors='coerce')
-
-    # Replace 'None' and empty strings with NaN
-    df.replace({'None': np.nan, '': np.nan}, inplace=True)
-
-    return df
-
-
-
-def rename_columns(conn, df):
-    """Rename columns in DataFrame according to mapping table and in SQL table."""
-    column_mapping_df = fetch_column_mapping(conn)
-    column_mapping = {}
-    for _, row in column_mapping_df.iterrows():
-        old_column_name = row['RoadsideColumnName']
-        new_column_name = row['TransformedColumnName']
-        if old_column_name in df.columns:
-            column_mapping[old_column_name] = new_column_name
-            df.rename(columns={old_column_name: new_column_name}, inplace=True)
-            try:
-                alter_query = f"EXEC sp_rename 'tbtriexrecondailydetail.{old_column_name}', '{new_column_name}', 'COLUMN'"
-                conn.execute(alter_query)
-            except Exception as e:
-                logging.warning(f"Failed to rename column in SQL: {e}")
+                        # In all other cases, insert the incoming row into history.
+                        session.execute(history_table.insert().values(row_dict))
+            break  # Break out of the retry loop if successful.
+        except OperationalError as oe:
+            if "deadlock victim" in str(oe):
+                retries += 1
+                logging.warning(f"Deadlock detected for TransactionID {row_dict['TransactionID']}. Retrying {retries}/{max_retries}...")
+                session.rollback()
+                time.sleep(retry_wait * (2 ** retries))
                 continue
-    return column_mapping
-
-def fetch_column_mapping(conn):
-    """Fetch column renaming mapping data from SQL Server."""
-    query = "SELECT RoadsideColumnName, TransformedColumnName FROM tbMappingTableColumns"
-    return pd.read_sql(query, conn)
-
-def fetch_history_table(conn, metadata):
-    """Fetch mapping data from SQL Server."""
-    tb_history = Table('tbtriexrecondailydetailhist', metadata, autoload_with=conn)
-    query = select(tb_history)
-    return pd.read_sql(query, conn)
-
-def rename_history_columns(conn, df):
-    """Rename columns in DataFrame according to mapping table and in SQL table."""
-    column_mapping_df = fetch_column_mapping(conn)
-    for _, row in column_mapping_df.iterrows():
-        old_column_name = row['RoadsideColumnName']
-        new_column_name = row['TransformedColumnName']
-        if old_column_name in df.columns:
-            df.rename(columns={old_column_name: new_column_name}, inplace=True)
-            try:
-                alter_query = f"EXEC sp_rename 'tbtriexrecondailydetailhist.{old_column_name}', '{new_column_name}', 'COLUMN'"
-                conn.execute(alter_query)
-            except Exception as e:
-                logging.warning(f"Failed to rename history column in SQL: {e}")
-                continue
-
-def fetch_step_one_mapping(conn):
-    """Fetch mapping data from SQL Server."""
-    query = "SELECT * FROM NCTARECONPROD.dbo.tbMappingTableStep1"
-    return pd.read_sql(query, conn)
-    
-"""
-def perform_step_one_mapping(df, mapping_df):
-    columns_to_string = mapping_df['RoadsideColumnA'].dropna().unique().tolist()
-    for col in columns_to_string:
-        if col in df.columns and df[col].dtype != object:
-            df[col] = df[col].astype(str)
-    
-    transformed_columns = mapping_df['TransformedColumn'].dropna().unique().tolist()
-    for tcol in transformed_columns:
-        if tcol not in df.columns:
-            df[tcol] = None
-
-    mapping_df.fillna("NULL", inplace=True)
-    mapping_df['RoadsideValueA'] = mapping_df['RoadsideValueA'].astype(str)
-    mapping_df['TransformedValue'] = mapping_df['TransformedValue'].replace(["NONE", "NULL"], None)
-    
-    for col_search, val_search, col_replace, val_replace in mapping_df.values:
-        if val_search == "NULL":
-            mask = df[col_search].isnull()
-        else:
-            mask = (df[col_search] == val_search)
-        df.loc[mask, col_replace] = val_replace
-    
-    df.replace('None', None, inplace=True)
-    return df
-    """
-
-from tqdm import tqdm
-import pandas as pd
-import numpy as np
-
-def perform_step_one_mapping(df, mapping_df):
-    """
-    Vectorized approach that only applies mappings where Roadway == 'T33'.
-    We also only transform rows in df where df['Roadway'] == 'T33'.
-    """
-
-    import pandas as pd
-    import numpy as np
-    from tqdm import tqdm
-
-    # 1) Filter the mapping table to Roadway == 'T33'
-    if 'Roadway' in mapping_df.columns:
-        mapping_df = mapping_df[mapping_df['Roadway'] == 'T33']
-    else:
-        # If there's no Roadway column in mapping_df, no mapping is done
-        return df
-
-    # If no rows remain, nothing to do
-    if mapping_df.empty:
-        return df
-
-    # 2) Identify all unique search columns in the filtered mapping_df
-    unique_search_cols = mapping_df['RoadsideColumnA'].dropna().unique()
-    for col in unique_search_cols:
-        if col in df.columns and df[col].dtype != object:
-            df[col] = df[col].astype(str)
-
-    # 3) Ensure all 'TransformedColumn' columns exist in df
-    unique_replace_cols = mapping_df['TransformedColumn'].dropna().unique()
-    for col in unique_replace_cols:
-        if col not in df.columns:
-            df[col] = None
-
-    # 4) Group the mapping by (RoadsideColumnA, TransformedColumn)
-    group_cols = ['RoadsideColumnA', 'TransformedColumn']
-    grouped = mapping_df.groupby(group_cols, dropna=True)
-    total_groups = grouped.ngroups
-
-    # 5) We'll also build a mask for df's Roadway == 'T33'
-    #    so we only modify those rows in the DataFrame.
-    if 'Roadway' in df.columns:
-        mask_roadway_df = (df['Roadway'] == 'T33')
-    else:
-        # If df doesn't have Roadway, we can't apply filtering, so do nothing
-        return df
-
-    # 6) Iterate with a progress bar
-    for (col_search, col_replace), submap in tqdm(grouped,
-                                                  total=total_groups,
-                                                  desc="Step One Mapping Groups"):
-        # Skip if df doesn’t actually have these columns
-        if col_search not in df.columns or col_replace not in df.columns:
-            continue
-
-        replace_dict = {}
-        null_val_replace = None
-
-        # Build dictionary for all rows in this group
-        for _, row in submap.iterrows():
-            val_search = row['RoadsideValueA']
-            val_replace = row['TransformedValue']
-
-            if pd.isnull(val_search) or str(val_search).upper() == 'NULL':
-                null_val_replace = val_replace
             else:
-                replace_dict[str(val_search)] = val_replace
-
-        # Single pass for null search
-        if null_val_replace is not None:
-            mask_null = mask_roadway_df & (df[col_search].isnull() | (df[col_search] == 'nan'))
-            df.loc[mask_null, col_replace] = null_val_replace
-
-        # Single pass for normal replacements
-        mapped_series = df.loc[mask_roadway_df, col_search].map(replace_dict)  
-        mask_mapped_notnull = mapped_series.notnull()
-
-        # Assign only where we have a non-null mapped value
-        df.loc[mask_roadway_df & mask_mapped_notnull, col_replace] = mapped_series[mask_mapped_notnull]
-
-    # Replace literal string "None" with actual None
-    df.replace('None', None, inplace=True)
-    return df
-
-
-def fetch_step_two_mapping(conn):
-    """Fetch additional mapping data from SQL Server."""
-    query = "SELECT * FROM NCTARECONPROD.dbo.tbMappingTableStep2"
-    return pd.read_sql(query, conn)
-
-def perform_step_two_mapping(df, mapping_df):
-    """
-    Step 2 Mapping, but only for rows where Roadway == 'T33' in the mapping table
-    and also only modifies df rows where df['Roadway'] == 'T33'.
-    """
-
-    import pandas as pd
-    import numpy as np
-    from tqdm import tqdm
-
-    # 1) Filter the mapping table
-    if 'Roadway' in mapping_df.columns:
-        mapping_df = mapping_df[mapping_df['Roadway'] == 'T33']
-    else:
-        return df
-
-    if mapping_df.empty:
-        return df
-
-    # 2) Cast df columns to string once if needed
-    colA_list = mapping_df['RoadsideColumnA'].dropna().unique().tolist()
-    colB_list = mapping_df['RoadsideColumnB'].dropna().unique().tolist()
-
-    for cA in colA_list:
-        if cA in df.columns and df[cA].dtype != object:
-            df[cA] = df[cA].astype(str)
-
-    for cB in colB_list:
-        if cB in df.columns and df[cB].dtype != object:
-            df[cB] = df[cB].astype(str)
-
-    # 3) Ensure columns in 'TransformedColumn' exist
-    for _, row in mapping_df.iterrows():
-        trans_cols = row['TransformedColumn']
-        if pd.notnull(trans_cols):
-            for tcol in trans_cols.split(','):
-                tcol = tcol.strip()
-                if tcol not in df.columns:
-                    df[tcol] = None
-
-    # 4) We'll build a roadway mask for df
-    if 'Roadway' not in df.columns:
-        return df
-    mask_roadway_df = (df['Roadway'] == 'T33')
-
-    # 5) Use a progress bar around the main loop
-    with tqdm(total=len(mapping_df), desc="Step Two Mapping (T33)", unit="row") as pbar:
-        for _, row in mapping_df.iterrows():
-            colA = row['RoadsideColumnA']
-            valA = row['RoadsideValueA']
-            colB = row['RoadsideColumnB']
-            valB = row['RoadsideValueB']
-            trans_cols = row['TransformedColumn']
-            trans_vals = row['TransformedValue']
-
-            if pd.isnull(colA) or pd.isnull(colB) or pd.isnull(trans_cols) or pd.isnull(trans_vals):
-                pbar.update(1)
-                continue
-
-            # Build masks for colA, colB
-            if isinstance(valA, str) and valA.upper() == 'NULL':
-                maskA = df[colA].isnull()
-            else:
-                maskA = (df[colA] == str(valA))
-
-            if isinstance(valB, str) and valB.upper() == 'NULL':
-                maskB = df[colB].isnull()
-            else:
-                maskB = (df[colB] == str(valB))
-
-            # Combine with roadway mask
-            combined_mask = mask_roadway_df & maskA & maskB
-
-            # Parse TransformedColumn, TransformedValue
-            col_list = [c.strip() for c in trans_cols.split(',')]
-            val_list = [v.strip() for v in trans_vals.split(',')]
-            if len(col_list) != len(val_list):
-                pbar.update(1)
-                continue
-
-            # Assign
-            for cfinal, vfinal in zip(col_list, val_list):
-                if isinstance(vfinal, str) and vfinal.upper() in ['NONE', 'NULL']:
-                    vfinal = None
-                df.loc[combined_mask, cfinal] = vfinal
-
-            pbar.update(1)
-
-    return df
+                session.rollback()
+                raise
+        except Exception as e:
+            session.rollback()
+            raise
+    last_processed_row["num_records_processed"] += 1
+    last_processed_row["index_id"] = row_dict["TransactionID"]
+    if pbar is not None:
+        pbar.update(1)
 
 
 
 
-def fetch_step_three_mapping(conn):
-    """Fetch column renaming mapping data from SQL Server."""
-    query = "SELECT ColumnA, ColumnB, ColumnC, FinalColumn FROM NCTARECONPROD.dbo.tbMappingOCRValues"
-    return pd.read_sql(query, conn)
 
-def perform_step_three_mapping(df, mapping_df):
-    """
-    Step 3 Mapping, only applying to rows where mapping_df['Roadway'] == 'T33'
-    and df['Roadway'] == 'T33'.
-    """
-
-    import pandas as pd
-    import numpy as np
-    from tqdm import tqdm
-
-    # 1) Filter mapping_df to Roadway == 'T33'
-    if 'Roadway' in mapping_df.columns:
-        mapping_df = mapping_df[mapping_df['Roadway'] == 'T33']
-    else:
-        return df
-
-    if mapping_df.empty:
-        return df
-
-    # 2) Cast relevant columns to string once
-    all_cols = set(mapping_df['ColumnA'].dropna()).union(
-        set(mapping_df['ColumnB'].dropna()),
-        set(mapping_df['ColumnC'].dropna()),
-        set(mapping_df['FinalColumn'].dropna())
-    )
-    for col in all_cols:
-        if col in df.columns and df[col].dtype != object:
-            df[col] = df[col].astype(str)
-
-    # 3) Ensure final columns exist
-    for final_col in mapping_df['FinalColumn'].dropna().unique():
-        if final_col not in df.columns:
-            df[final_col] = None
-
-    # 4) We'll also build a roadway mask for df
-    if 'Roadway' not in df.columns:
-        return df
-    mask_roadway_df = (df['Roadway'] == 'T33')
-
-    # 5) Mapping pass with a progress bar
-    with tqdm(total=len(mapping_df), desc="Step Three Mapping (T33)", unit="row") as pbar:
-        for _, row in mapping_df.iterrows():
-            colA = row['ColumnA']
-            colB = row['ColumnB']
-            colC = row['ColumnC']
-            final_col = row['FinalColumn']
-
-            # Skip if missing
-            if pd.isnull(colA) or pd.isnull(colB) or pd.isnull(colC) or pd.isnull(final_col):
-                pbar.update(1)
-                continue
-
-            # Step 1: If df[colA] notnull => final_col = colA
-            maskA = mask_roadway_df & df[colA].notnull()
-            df.loc[maskA, final_col] = df.loc[maskA, colA]
-
-            # Step 2: If final_col is still null & df[colB].notnull => final_col = colB
-            maskB = mask_roadway_df & df[final_col].isnull() & df[colB].notnull()
-            df.loc[maskB, final_col] = df.loc[maskB, colB]
-
-            # Step 3: If final_col is still null & df[colC].notnull => final_col = colC
-            maskC = mask_roadway_df & df[final_col].isnull() & df[colC].notnull()
-            df.loc[maskC, final_col] = df.loc[maskC, colC]
-
-            pbar.update(1)
-
-    return df
 
 
 
