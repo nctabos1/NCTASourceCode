@@ -1,0 +1,71 @@
+{
+  "reconciliation_name": "Monroe_Test_Reconciliation",
+  "environment": {
+    "DATABASE_URI": "mssql+pymssql://NCTA_Reports:NCTurnp!k3DB@report.prod.nctabos.net/NCTARECON",
+    "SFTP_HOST": "10.225.16.6",
+    "SFTP_USERNAME": "MonroeDataIngest",
+    "SFTP_PASSWORD": "f!%5mLsjf7"
+  },
+  "logging": {
+    "log_file": "logs/reconciliation_log.txt",
+    "log_level": "INFO"
+  },
+  "file_processing": {
+    "sftp_directory": "/Dataingest/",
+    "local_directory": "C:/Users/KhokharA/Documents/TESTING/Configurable Reconciliation Program/TestCSVs",
+    "file_prefix": "ME_DI_",
+    "file_extension": ".zip",
+    "checkpoint_table": "tbCheckpoint",
+    "main_table": "tbMonroeReconDetail"
+  },
+  "mapping": {
+    "table": "tbMasterMappings",
+    "steps": [
+      {
+        "step": 1,
+        "name": "Column Renaming",
+        "filter": {
+          "Source": "tbMappingTableColumns",
+          "Roadway": "T41"
+        },
+        "description": "Rename DataFrame columns.",
+        "type": "rename"
+      },
+      {
+        "step": 2,
+        "name": "Value Mapping Step One",
+        "filter": {
+          "Source": "tbMappingTableStep1",
+          "Roadway": "T41"
+        },
+        "conditions": [
+          { "source": "RoadsideColumnA", "value": "RoadsideValueA" }
+        ],
+        "description": "Replace values in a single column when the condition is met."
+      },
+      {
+        "step": 3,
+        "name": "Value Mapping Step Two",
+        "filter": {
+          "Source": "tbMappingTableStep2",
+          "Roadway": "T41"
+        },
+        "conditions": [
+          { "source": "RoadsideColumnA", "value": "RoadsideValueA" },
+          { "source": "RoadsideColumnB", "value": "RoadsideValueB" }
+        ],
+        "description": "Replace values when both conditions (from two columns) are met."
+      },
+      {
+        "step": 4,
+        "name": "OCR Mapping",
+        "filter": {
+          "Source": "tbMappingOCRValues",
+          "Roadway": "T41"
+        },
+        "description": "Apply OCR-related mappings to generate final OCR values.",
+        "type": "ocr"
+      }
+    ]
+  }
+}
