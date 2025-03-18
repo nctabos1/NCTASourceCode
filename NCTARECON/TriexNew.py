@@ -24,13 +24,22 @@ SFTP_HOST = os.getenv('SFTP_HOST')
 SFTP_USERNAME = os.getenv('SFTP_USERNAME')
 SFTP_PASSWORD = os.getenv('SFTP_PASSWORD')
 
-LOG_FILE = "error_log.txt"
+# Function to generate log filename dynamically
+def get_log_filename():
+    current_date = datetime.now().strftime("%Y-%m-%d")  # Format: YYYY-MM-DD
+    log_directory = "logs"  # Create a separate folder for logs
+    if not os.path.exists(log_directory):
+        os.makedirs(log_directory)  # Ensure directory exists
+    return os.path.join(log_directory, f"error_log_triex_{current_date}.txt")
+
+# Configure logging
+LOG_FILE = get_log_filename()
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(message)s",
     handlers=[
-        logging.FileHandler(LOG_FILE),   # Log to file
-        logging.StreamHandler()          # Log to console
+        logging.FileHandler(LOG_FILE),  # Log to daily file
+        logging.StreamHandler()         # Log to console
     ]
 )
 
