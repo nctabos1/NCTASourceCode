@@ -8,23 +8,54 @@ import numpy as np
 import pandas as pd
 from datetime import datetime, timedelta
 from sqlalchemy import create_engine, MetaData, Table, select, insert
+import subprocess
+import pymssql
 
 # -----------------------------------------------------------------------------
-# 1. Load configuration and set up logging
+# 1. Load configuration and set up logging using GitHub
 # -----------------------------------------------------------------------------
-def load_config(config_path):
-    with open(config_path, "r") as f:
-        return json.load(f)
+def get_git_branch():
+    """Returns the current git branch name."""
+    try:
+        return subprocess.check_output(["git", "rev-parse", "--abbrev-ref", "HEAD"], text=True).strip()
+    except Exception as e:
+        print(f"Error determining git branch: {e}")
+        return "unknown"
 
-CONFIG_PATH = r"C:\Users\KhokharA\Documents\TESTING\Configurable Reconciliation Program\recon_config_triex.json"
-config = load_config(CONFIG_PATH)
+def get_roadway():
+    """Determines the roadway from an environment variable."""
+    roadway = os.getenv("ROADWAY", "").lower()
+    if roadway not in ["triex", "monroe"]:
+        raise ValueError("Invalid or missing roadway. Must be 'triex' or 'monroe'. Set the ROADWAY environment variable.")
+    return roadway
 
-logging.basicConfig(
-    filename=config["logging"]["log_file"],
-    level=getattr(logging, config["logging"]["log_level"].upper()),
-    format="%(asctime)s - %(levelname)s - %(message)s"
-)
+def load_config():
+    """Loads the appropriate config file based on Git branch and roadway."""
+    branch = get_git_branch()
+    roadway = os.getenv("ROADWAY", "").lower()
 
+    if roadway not in ["triex", "monroe"]:
+        raise ValueError(f"Invalid or missing ROADWAY environment variable. Must be 'triex' or 'monroe'. Current: {roadway}")
+
+    env = "prod" if branch == "main" else "dev"
+    config_filename = f"recon_config_{roadway}.{env}.json"
+
+    print(f"Loading config file: {config_filename}")  # Debugging output
+
+    if not os.path.exists(config_filename):
+        raise FileNotFoundError(f"Config file {config_filename} not found.")
+
+    with open(config_filename, "r", encoding="utf-8") as f:
+        content = f.read().strip()
+        if not content:
+            raise ValueError(f"Config file {config_filename} is empty!")
+        
+        return json.loads(content)
+
+
+# Load config
+config = load_config()
+    
 # -----------------------------------------------------------------------------
 # 2. Extract configurations and create DB engine
 # -----------------------------------------------------------------------------
